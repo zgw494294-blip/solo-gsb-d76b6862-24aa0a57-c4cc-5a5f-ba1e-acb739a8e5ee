@@ -10,6 +10,10 @@
 - **空白扣除**：对样本与空白两次运行分别积分并按峰顶时间归属，仅对归属**同一参考 id** 的峰
   用各自精确面积（整数面积 ÷ 各自 area_scale）相减、负值截零，输出按样本峰顶顺序的
   校正面积与统一放大的整数峰数组。
+- **可复核批次**：一次提交共用扣除参数、一个 blank 与 **1～8 组带唯一字符串 id 的样本**，
+  服务端复用同一空白扣除上下文批量计算并以 SQLite 持久化；支持读取、按样本 id 逐组确认、
+  替换 blank 后原子重算全部样本。所有修改携带**预期版本号**（乐观并发），
+  已确认结果受保护：任何一组已确认结果改变，整批替换报 **409**。
 
 Python 3.12 + FastAPI，全部时间/偏差/拟合/面积计算使用 `fractions.Fraction` 精确有理数，
 返回约分后的 `n/d`。
@@ -25,6 +29,7 @@ docker compose up --build -d
 - 标准加入法定量：`POST http://localhost:8000/v1/standard-addition`
 - 峰面积积分：`POST http://localhost:8000/v1/integrate`
 - 空白扣除：`POST http://localhost:8000/v1/blank-subtraction`
+- 可复核批次：`POST http://localhost:8000/v1/blank-subtraction-batches`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互文档：`http://localhost:8000/docs`（Swagger UI）
 
@@ -549,6 +554,186 @@ echo "$RESP" | jq '. as $r | {
 - 共用参考峰表/内标/容差不合法（在处理样本组时被发现，前缀为 `sample: `）；
 - 类型错误（布尔不会被当作整数、浮点不会被截断为整数）或缺少必填字段。
 
+## 可复核批次（共用空白的多样本工作流）
+
+一批样本共用同一份空白与扣除参数，提交后可**逐组复核确认**，或在发现空白测错时
+**替换 blank 并原子重算整批样本**。批次与结果保存在容器内 **SQLite**
+（`/data/batches.db`，经 Compose 命名卷 `batch-data` 挂载），容器重启/重建后仍可读取。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/v1/blank-subtraction-batches` | 创建批次（201）：共用参数 + `blank` + 1～8 组带唯一 `id` 的样本 |
+| `GET` | `/v1/blank-subtraction-batches/{id}` | 读取批次（只见完整已提交状态） |
+| `POST` | `/v1/blank-subtraction-batches/{id}/samples/{sample_id}/confirm` | 确认一组样本 |
+| `PUT` | `/v1/blank-subtraction-batches/{id}/blank` | 替换 blank 并重算全部样本 |
+
+批次响应形如：
+
+```json
+{
+  "id": "8f1c…（32 位十六进制）",
+  "version": 1,
+  "samples": [
+    {"id": "s-1", "confirmed": false, "result": { …同 /v1/blank-subtraction 响应… }},
+    {"id": "s-2", "confirmed": false, "result": { … }}
+  ]
+}
+```
+
+- `samples` 严格按**输入顺序**返回；创建后 `version = 1`，全部 `confirmed = false`。
+- 每次成功的确认或 blank 替换使 `version + 1`；请求体必须携带 `expected_version`，
+  与当前版本不一致返回 **409**（过期）。同版本下并发的“确认”与“替换”只有一项会成功。
+- 批次创建后**只允许替换 blank**：参考峰、内标、容差、样本及其 id、顺序均不可改
+  （修改请求夹带其他字段直接 422）。
+- 确认不可覆盖：已确认的样本不能再次确认（409）。
+- 替换 blank 时，对所有**已确认**结果按**峰顺序**逐项比较
+  `(time_ms, ref_id, 约分校正面积 n/d)`：任一组已确认样本发生变化，则**整批回滚报 409**
+  （`detail` 列出受影响样本 id），输入、结果、确认状态与版本均不变；
+  全部已确认结果不变时（无论未确认样本如何变化）允许替换，版本照常 +1。
+- 计算失败返回 **422** 并指出对象：`blank: …` 或 `sample <id>: …`；
+  批次创建失败**不会**留下任何批次。批次/样本 id 不存在返回 **404**。
+
+### 端到端可执行示例
+
+以下命令可直接逐条执行（需 `jq`）：
+
+```bash
+BASE=http://localhost:8000
+
+# 1) 创建批次：一个 blank、两组样本 s-1 / s-2
+RESP=$(curl -s -X POST "$BASE/v1/blank-subtraction-batches" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference_peaks": [
+      {"id": "A", "time_ms": 3},
+      {"id": "B", "time_ms": 7}
+    ],
+    "is_ref_id_1": "A", "is_ref_id_2": "B",
+    "tolerance_ms": 0,
+    "blank": {
+      "samples": [
+        {"time_ms": 0,  "intensity": 1},
+        {"time_ms": 5,  "intensity": 2},
+        {"time_ms": 6,  "intensity": 1},
+        {"time_ms": 9,  "intensity": 3},
+        {"time_ms": 14, "intensity": 1}
+      ],
+      "start_index": 0, "end_index": 4,
+      "apex_indices": [1, 3],
+      "is_apex_idx_1": 0, "is_apex_idx_2": 1
+    },
+    "samples": [
+      {"id": "s-1",
+       "samples": [
+         {"time_ms": 0,  "intensity": 1},
+         {"time_ms": 3,  "intensity": 4},
+         {"time_ms": 4,  "intensity": 2},
+         {"time_ms": 7,  "intensity": 5},
+         {"time_ms": 10, "intensity": 0}
+       ],
+       "start_index": 0, "end_index": 4,
+       "apex_indices": [1, 3],
+       "is_apex_idx_1": 0, "is_apex_idx_2": 1},
+      {"id": "s-2",
+       "samples": [
+         {"time_ms": 0,  "intensity": 1},
+         {"time_ms": 3,  "intensity": 4},
+         {"time_ms": 4,  "intensity": 2},
+         {"time_ms": 7,  "intensity": 5},
+         {"time_ms": 10, "intensity": 0}
+       ],
+       "start_index": 0, "end_index": 4,
+       "apex_indices": [1, 3],
+       "is_apex_idx_1": 0, "is_apex_idx_2": 1}
+    ]
+  }')
+BID=$(echo "$RESP" | jq -r .id)
+echo "$RESP" | jq '{id, version, samples: [.samples[] | {id, confirmed}]}'
+# => {"id":"…","version":1,"samples":[{"id":"s-1","confirmed":false},
+#                                    {"id":"s-2","confirmed":false}]}
+
+# 2) 读取（容器重启后同样可读）
+curl -s "$BASE/v1/blank-subtraction-batches/$BID" | jq '.version, [.samples[].id]'
+
+# 3) 以预期版本 1 确认 s-1（版本变为 2）
+curl -s -X POST "$BASE/v1/blank-subtraction-batches/$BID/samples/s-1/confirm" \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 1}' | jq '{version, confirmed: [.samples[] | .confirmed]}'
+# => {"version":2,"confirmed":[true,false]}
+
+# 4) 替换 blank（强度更大）并携带当前版本 2 重算全部样本。
+#    s-1 已确认且其结果会改变 => 整批拒绝 409，状态不变。
+curl -s -o /tmp/body -w '%{http_code}\n' -X PUT \
+  "$BASE/v1/blank-subtraction-batches/$BID/blank" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expected_version": 2,
+    "blank": {
+      "samples": [
+        {"time_ms": 0,  "intensity": 1},
+        {"time_ms": 5,  "intensity": 3},
+        {"time_ms": 6,  "intensity": 1},
+        {"time_ms": 9,  "intensity": 4},
+        {"time_ms": 14, "intensity": 1}
+      ],
+      "start_index": 0, "end_index": 4,
+      "apex_indices": [1, 3],
+      "is_apex_idx_1": 0, "is_apex_idx_2": 1
+    }
+  }'
+# => 409
+cat /tmp/body; echo
+# => {"detail":"replacement would change confirmed results for samples: s-1"}
+
+# 5) 用与当前完全相同的 blank 替换：已确认结果不变 => 允许，版本 2 -> 3
+curl -s -X PUT "$BASE/v1/blank-subtraction-batches/$BID/blank" \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_version": 2, "blank": {
+        "samples": [
+          {"time_ms": 0,  "intensity": 1},
+          {"time_ms": 5,  "intensity": 2},
+          {"time_ms": 6,  "intensity": 1},
+          {"time_ms": 9,  "intensity": 3},
+          {"time_ms": 14, "intensity": 1}
+        ],
+        "start_index": 0, "end_index": 4,
+        "apex_indices": [1, 3],
+        "is_apex_idx_1": 0, "is_apex_idx_2": 1}}' \
+  | jq '{version, confirmed: [.samples[] | .confirmed]}'
+# => {"version":3,"confirmed":[true,false]}
+
+# 6) 过期版本（仍传 2）确认 s-2 => 409；改用当前版本 3 才成功
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  "$BASE/v1/blank-subtraction-batches/$BID/samples/s-2/confirm" \
+  -H 'Content-Type: application/json' -d '{"expected_version": 2}'
+# => 409
+curl -s -X POST "$BASE/v1/blank-subtraction-batches/$BID/samples/s-2/confirm" \
+  -H 'Content-Type: application/json' -d '{"expected_version": 3}' \
+  | jq '{version, confirmed: [.samples[] | .confirmed]}'
+# => {"version":4,"confirmed":[true,true]}
+```
+
+### 持久化与重启
+
+```bash
+docker compose restart      # 或 down 后再 up（卷保留）
+# 之后 GET /v1/blank-subtraction-batches/{id} 仍返回重启前的版本、结果与确认状态
+```
+
+彻底删除批次数据：`docker compose down -v`（同时删除命名卷）。
+数据库路径可用环境变量 `BATCH_DB_PATH` 覆盖（默认 `/data/batches.db`）。
+
+### 错误处理汇总
+
+| 状态码 | 场景 |
+| --- | --- |
+| `404 Not Found` | 批次 id 不存在；确认时样本 id 不在批次中 |
+| `409 Conflict` | 版本过期；重复确认已确认样本；替换会改变任一已确认样本的结果（列出样本 id） |
+| `422 Unprocessable Entity` | blank 或某样本（`sample <id>: …`）积分/归属计算失败；样本数不在 1～8；样本 id 重复或为空；修改接口夹带不可改字段；严格类型错误或缺字段 |
+
+任何 4xx 失败都保持输入、结果、确认状态与版本不变；读取接口永远只返回完整的已提交状态；
+创建失败不会在数据库中留下批次。
+
 ## 本地开发与测试
 
 不用 Docker 时：
@@ -562,22 +747,28 @@ pip install pytest httpx
 pytest -q
 ```
 
+本地不用 Docker 时，批次 SQLite 默认路径为 `/data/batches.db`，可用
+`BATCH_DB_PATH=/tmp/batches.db uvicorn app.main:app --reload --port 8000` 覆盖。
+
 测试包含固定边界用例，以及 400 组随机实例与全局暴力枚举（枚举所有保序配对链）对拍，
 验证“最大配对数 → 最小绝对偏差和 → 字典序最小”三级目标；积分接口另有 300 组随机实例
-与独立浮点参照实现对拍，并含积分 → 归属 / 定量的端到端衔接测试。
+与独立浮点参照实现对拍，并含积分 → 归属 / 定量的端到端衔接测试。批次测试覆盖
+创建/读取/确认/替换 blank、乐观版本、409/422/404、失败原子性、同版本并发互斥与
+SQLite 文件持久化。
 
 ## 目录结构
 
 ```
 app/
-  main.py               # FastAPI 应用、路由、422 异常映射
+  main.py               # FastAPI 应用、路由、422/409/404 异常映射
   models.py             # 严格类型的请求/响应模型
   assignment.py         # 仿射校准 + 区间 DP 归属（纯函数）
   standard_addition.py  # 标准加入法：逐次归属 + 精确最小二乘（纯函数）
   integration.py        # 峰面积积分：分段 + 扣基线 + 精确梯形积分（纯函数）
   blank_subtraction.py  # 空白扣除：双运行积分 + 归属 + 精确相减（纯函数）
+  batch_store.py        # 可复核批次：SQLite 持久化 + 乐观版本并发
 tests/                  # API 测试与算法对拍测试
 Dockerfile
-docker-compose.yml
+docker-compose.yml      # 命名卷 batch-data -> /data（SQLite 批次库）
 requirements.txt
 ```

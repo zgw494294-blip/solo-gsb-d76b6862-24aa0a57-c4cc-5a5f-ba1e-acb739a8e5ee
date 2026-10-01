@@ -4,7 +4,12 @@ services:
     image: peak-assign:latest
     container_name: peak-assign
     ports:
-      - "8000:8000"
+      "8000:8000"
+    environment:
+      # SQLite 批次数据库位于命名卷内，容器重启/重建后仍可读取
+      BATCH_DB_PATH: /data/batches.db
+    volumes:
+      - batch-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
@@ -12,3 +17,6 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+
+volumes:
+  batch-data:

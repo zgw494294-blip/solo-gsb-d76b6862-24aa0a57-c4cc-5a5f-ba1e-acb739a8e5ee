@@ -7,6 +7,9 @@
 该参考峰则不扣，样本未归属峰保持原面积，空白独有峰不输出。全部校正面积
 分母的最小公倍数作为统一 area_scale 放大为整数峰数组（零面积保留），
 可直接供标准加入法定量接口使用。
+
+``prepare_blank`` 与 ``subtract_sample`` 拆开后，批次接口可只准备一次
+空白扣除上下文，再对 1～8 组样本（或替换 blank 后重算全部样本）复用。
 """
 
 from __future__ import annotations
@@ -56,24 +59,18 @@ def _integrate_and_assign(
     return integrated, assigned
 
 
-def blank_subtraction(
+def prepare_blank(
     ref_peaks: list[dict[str, Any]],
     is_ref_id_1: Any,
     is_ref_id_2: Any,
     tolerance_ms: int,
-    sample: dict[str, Any],
     blank: dict[str, Any],
 ) -> dict[str, Any]:
-    """空白扣除主流程，返回可直接序列化的结果字典。"""
+    """积分并归属空白运行，返回扣除所需上下文（ref_ids 与各参考 id 面积）。"""
     ref_ids = [p["id"] for p in ref_peaks]
-
-    sample_int, sample_asg = _integrate_and_assign(
-        sample, ref_peaks, is_ref_id_1, is_ref_id_2, tolerance_ms, "sample"
-    )
     blank_int, blank_asg = _integrate_and_assign(
         blank, ref_peaks, is_ref_id_1, is_ref_id_2, tolerance_ms, "blank"
     )
-
     # 空白：参考 id -> 精确面积（整数面积 / 自身 area_scale）；
     # 归属为一对一，每个参考 id 至多对应一个空白峰。
     blank_area_by_ref: dict[Any, Fraction] = {}
@@ -82,6 +79,17 @@ def blank_subtraction(
             blank_area_by_ref[ref_ids[ref_idx]] = Fraction(
                 blank_int["peaks"][meas_idx]["area"], blank_int["area_scale"]
             )
+    return {"ref_ids": ref_ids, "blank_area_by_ref": blank_area_by_ref}
+
+
+def _build_result(
+    sample_int: dict[str, Any],
+    sample_asg: dict[str, Any],
+    blank_ctx: dict[str, Any],
+) -> dict[str, Any]:
+    """以已积分/归属好的样本与空白上下文执行精确扣除并组装输出。"""
+    ref_ids = blank_ctx["ref_ids"]
+    blank_area_by_ref = blank_ctx["blank_area_by_ref"]
 
     # 样本：实测（峰顶）下标 -> 参考 id
     sample_ref_by_meas = {
@@ -118,3 +126,40 @@ def blank_subtraction(
         "area_scale": scale,
         "peaks": peaks,
     }
+
+
+def subtract_sample(
+    ref_peaks: list[dict[str, Any]],
+    is_ref_id_1: Any,
+    is_ref_id_2: Any,
+    tolerance_ms: int,
+    sample: dict[str, Any],
+    blank_ctx: dict[str, Any],
+) -> dict[str, Any]:
+    """对一组样本积分、归属并以已准备好的空白上下文做精确扣除。"""
+    sample_int, sample_asg = _integrate_and_assign(
+        sample, ref_peaks, is_ref_id_1, is_ref_id_2, tolerance_ms, "sample"
+    )
+    return _build_result(sample_int, sample_asg, blank_ctx)
+
+
+def blank_subtraction(
+    ref_peaks: list[dict[str, Any]],
+    is_ref_id_1: Any,
+    is_ref_id_2: Any,
+    tolerance_ms: int,
+    sample: dict[str, Any],
+    blank: dict[str, Any],
+) -> dict[str, Any]:
+    """空白扣除主流程（单样本接口用），返回可直接序列化的结果字典。
+
+    保持历史行为：样本与空白分别处理，共用参数（参考峰/内标）错误在处理
+    样本时即被发现，错误消息前缀为 ``sample: ``。
+    """
+    sample_int, sample_asg = _integrate_and_assign(
+        sample, ref_peaks, is_ref_id_1, is_ref_id_2, tolerance_ms, "sample"
+    )
+    blank_ctx = prepare_blank(
+        ref_peaks, is_ref_id_1, is_ref_id_2, tolerance_ms, blank
+    )
+    return _build_result(sample_int, sample_asg, blank_ctx)

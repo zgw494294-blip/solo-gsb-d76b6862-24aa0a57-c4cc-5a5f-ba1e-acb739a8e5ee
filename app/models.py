@@ -171,3 +171,49 @@ class BlankSubtractionResponse(BaseModel):
     # 按样本峰顶时间排序的整数峰数组（零面积保留），可直接作为
     # /v1/standard-addition 的 measured_peaks
     peaks: list[MeasuredPeak]
+
+
+# ---------------------------------------------------------------------------
+# 空白扣除可复核批次（/v1/blank-subtraction-batches）
+# ---------------------------------------------------------------------------
+
+class BatchSampleRun(BlankSubtractionRun):
+    # 批次内唯一的样本字符串 id（非空）；结果按提交顺序返回
+    id: StrictStr = Field(min_length=1)
+
+
+class BatchCreateRequest(BaseModel):
+    # 共用扣除参数与 /v1/blank-subtraction 完全一致
+    reference_peaks: list[ReferencePeak] = Field(min_length=2, max_length=40)
+    is_ref_id_1: StrictStr
+    is_ref_id_2: StrictStr
+    tolerance_ms: StrictInt = Field(ge=0)
+    blank: BlankSubtractionRun
+    # 1～8 组样本，id 在批次内唯一（唯一性业务层校验，重复报 422）
+    samples: list[BatchSampleRun] = Field(min_length=1, max_length=8)
+
+
+class BatchSampleOut(BaseModel):
+    # 按输入顺序；confirmed 初始为 false
+    id: str
+    confirmed: bool
+    result: BlankSubtractionResponse
+
+
+class BatchResponse(BaseModel):
+    id: str
+    version: int
+    samples: list[BatchSampleOut]
+
+
+class BatchConfirmRequest(BaseModel):
+    # 乐观并发：仅当服务端当前版本等于该值时确认成功
+    model_config = {"extra": "forbid"}
+    expected_version: int = Field(ge=1)
+
+
+class BatchReplaceBlankRequest(BaseModel):
+    # 批次创建后只允许替换 blank；其余输入不可改
+    model_config = {"extra": "forbid"}
+    expected_version: int = Field(ge=1)
+    blank: BlankSubtractionRun
