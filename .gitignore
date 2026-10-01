@@ -3,3 +3,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 .deps/
+batches.db
+batches.db-wal
+batches.db-shm
+data/

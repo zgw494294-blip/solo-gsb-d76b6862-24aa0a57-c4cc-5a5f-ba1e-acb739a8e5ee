@@ -5,6 +5,11 @@ services:
     container_name: peak-assign
     ports:
       - "8000:8000"
+    environment:
+      # 可复核批次的 SQLite 数据库路径（位于下方持久卷内，重启不丢）
+      BATCH_DB_PATH: /data/batches.db
+    volumes:
+      - peak-assign-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
@@ -12,3 +17,6 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+
+volumes:
+  peak-assign-data:

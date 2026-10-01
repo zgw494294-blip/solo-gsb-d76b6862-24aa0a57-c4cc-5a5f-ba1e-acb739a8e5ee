@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field, StrictInt, StrictStr
+from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
 
 
 class ReferencePeak(BaseModel):
@@ -171,3 +171,63 @@ class BlankSubtractionResponse(BaseModel):
     # 按样本峰顶时间排序的整数峰数组（零面积保留），可直接作为
     # /v1/standard-addition 的 measured_peaks
     peaks: list[MeasuredPeak]
+
+
+# ---------------------------------------------------------------------------
+# 空白扣除可复核批次（/v1/blank-subtraction-batches）
+# ---------------------------------------------------------------------------
+
+class BatchSampleInput(BlankSubtractionRun):
+    # 批次内唯一的样本字符串 id；其余字段同单次空白扣除的 sample 运行
+    id: StrictStr = Field(min_length=1)
+
+
+class BatchCreateRequest(BaseModel):
+    # 扣除参数与 blank 同 /v1/blank-subtraction；samples 为 1～8 组带唯一 id 的样本
+    reference_peaks: list[ReferencePeak] = Field(min_length=2, max_length=40)
+    is_ref_id_1: StrictStr
+    is_ref_id_2: StrictStr
+    tolerance_ms: StrictInt = Field(ge=0)
+    blank: BlankSubtractionRun
+    samples: list[BatchSampleInput] = Field(min_length=1, max_length=8)
+
+    @field_validator("samples")
+    @classmethod
+    def _sample_ids_unique(cls, v: list[BatchSampleInput]) -> list[BatchSampleInput]:
+        ids = [s.id for s in v]
+        if len(set(ids)) != len(ids):
+            raise ValueError("sample ids must be unique within a batch")
+        return v
+
+
+class BatchConfirmRequest(BaseModel):
+    sample_id: StrictStr = Field(min_length=1)
+    # 乐观锁：客户端持有的版本，过期则 409
+    expected_version: StrictInt = Field(ge=1)
+
+
+class BatchBlankReplaceRequest(BaseModel):
+    # 仅 blank 可替换；其余输入（扣除参数、样本）不可改
+    blank: BlankSubtractionRun
+    expected_version: StrictInt = Field(ge=1)
+
+
+class BatchSampleOut(BaseModel):
+    # 与创建请求中的样本同序
+    id: str
+    confirmed: bool
+    # 该样本当前空白扣除结果（形状同 /v1/blank-subtraction 响应）
+    result: BlankSubtractionResponse
+    # 该样本的运行输入（id 在外层给出）
+    input: BlankSubtractionRun
+
+
+class BatchResponse(BaseModel):
+    batch_id: str
+    version: int
+    reference_peaks: list[ReferencePeak]
+    is_ref_id_1: str
+    is_ref_id_2: str
+    tolerance_ms: int
+    blank: BlankSubtractionRun
+    samples: list[BatchSampleOut]

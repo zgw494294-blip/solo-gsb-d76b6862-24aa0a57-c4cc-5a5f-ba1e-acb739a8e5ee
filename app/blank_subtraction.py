@@ -63,15 +63,22 @@ def blank_subtraction(
     tolerance_ms: int,
     sample: dict[str, Any],
     blank: dict[str, Any],
+    *,
+    sample_label: str = "sample",
+    blank_label: str = "blank",
 ) -> dict[str, Any]:
-    """空白扣除主流程，返回可直接序列化的结果字典。"""
+    """空白扣除主流程，返回可直接序列化的结果字典。
+
+    ``sample_label`` / ``blank_label`` 用于失败消息前缀：单样本接口固定为
+    ``sample`` / ``blank``；批次接口传入带样本 id 的前缀（如 ``sample "s2"``）。
+    """
     ref_ids = [p["id"] for p in ref_peaks]
 
     sample_int, sample_asg = _integrate_and_assign(
-        sample, ref_peaks, is_ref_id_1, is_ref_id_2, tolerance_ms, "sample"
+        sample, ref_peaks, is_ref_id_1, is_ref_id_2, tolerance_ms, sample_label
     )
     blank_int, blank_asg = _integrate_and_assign(
-        blank, ref_peaks, is_ref_id_1, is_ref_id_2, tolerance_ms, "blank"
+        blank, ref_peaks, is_ref_id_1, is_ref_id_2, tolerance_ms, blank_label
     )
 
     # 空白：参考 id -> 精确面积（整数面积 / 自身 area_scale）；

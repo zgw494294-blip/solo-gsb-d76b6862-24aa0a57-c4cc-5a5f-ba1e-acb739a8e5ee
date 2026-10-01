@@ -1,4 +1,4 @@
-# 离线色谱峰归属 / 标准加入法定量 / 峰面积积分 / 空白扣除 API
+# 离线色谱峰归属 / 标准加入法定量 / 峰面积积分 / 空白扣除 / 可复核批次 API
 
 - **峰归属**：基于 **两对互异内标** 对实测色谱峰进行正斜率仿射时间校准，并将实测峰与参考峰做
   **保序、一对一** 的最优归属。
@@ -10,6 +10,10 @@
 - **空白扣除**：对样本与空白两次运行分别积分并按峰顶时间归属，仅对归属**同一参考 id** 的峰
   用各自精确面积（整数面积 ÷ 各自 area_scale）相减、负值截零，输出按样本峰顶顺序的
   校正面积与统一放大的整数峰数组。
+- **可复核批次**：1～8 组样本**共用同一 blank** 与扣除参数保存为批次（SQLite 持久化），
+  初始版本 1、全部未确认；支持读取、按样本 id 逐项确认、替换 blank 后整批重算。
+  修改携带 `expected_version` 乐观锁，成功版本加 1，过期返回 409；
+  已确认结果约束 blank 替换——峰顺序、参考 id、`time_ms`、约分校正面积任一改变即整批拒绝。
 
 Python 3.12 + FastAPI，全部时间/偏差/拟合/面积计算使用 `fractions.Fraction` 精确有理数，
 返回约分后的 `n/d`。
@@ -25,10 +29,12 @@ docker compose up --build -d
 - 标准加入法定量：`POST http://localhost:8000/v1/standard-addition`
 - 峰面积积分：`POST http://localhost:8000/v1/integrate`
 - 空白扣除：`POST http://localhost:8000/v1/blank-subtraction`
+- 可复核批次：`POST/GET http://localhost:8000/v1/blank-subtraction-batches`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互文档：`http://localhost:8000/docs`（Swagger UI）
 
-停止：`docker compose down`
+停止：`docker compose down`（批次数据保存在 Docker 命名卷 `peak-assign-data` 中；
+`docker compose down -v` 才会删除数据卷）。
 
 ## `POST /v1/assign`（峰归属）
 
@@ -549,6 +555,195 @@ echo "$RESP" | jq '. as $r | {
 - 共用参考峰表/内标/容差不合法（在处理样本组时被发现，前缀为 `sample: `）；
 - 类型错误（布尔不会被当作整数、浮点不会被截断为整数）或缺少必填字段。
 
+## 可复核批次（`/v1/blank-subtraction-batches`）
+
+把 **1～8 组样本与同一个 blank** 及扣除参数保存为一个**可复核批次**，持久化在 SQLite 中
+（Docker 部署为命名卷，容器重启后仍可读取）。批次创建后只有两类修改：按样本 id **确认**、
+替换 **blank** 后重算全部样本；参考峰、内标、容差与各样本输入均**不可改**。
+
+### 数据模型与状态
+
+- 批次有单调递增的整数 `version`：**创建成功为 1**，此后每次成功的确认或 blank 替换加 1。
+- 每个样本有布尔 `confirmed`：创建时全部为 **false（未确认）**；确认只能把 false 翻成 true，
+  已确认样本不能覆盖确认。
+- 每个样本携带按**创建输入顺序**排列的 `id`、`confirmed`、当前扣除 `result`（形状同
+  `/v1/blank-subtraction` 响应）与原始 `input`。
+- 修改请求必须携带 `expected_version`；与当前版本不一致（过期）返回 **409**。
+- 同版本的并发确认/替换在数据库层串行化，**只有一项成功**（另一项 409），
+  不会覆盖确认也不会出现“确认与换空白混用”的中间状态。
+- 任何失败（422/409/404）都保持输入、结果、确认状态与版本不变；读取只会见到完整已提交状态；
+  创建失败不会留下批次。
+
+### `POST /v1/blank-subtraction-batches`（创建，`201`）
+
+请求体与 `/v1/blank-subtraction` 相同，但 `sample` 换成 **`samples` 数组（1～8 项）**，
+每项在运行输入外增加批次内**唯一非空字符串 id**：
+
+```bash
+curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reference_peaks": [
+      {"id": "A", "time_ms": 3},
+      {"id": "B", "time_ms": 7}
+    ],
+    "is_ref_id_1": "A", "is_ref_id_2": "B",
+    "tolerance_ms": 0,
+    "blank": {
+      "samples": [
+        {"time_ms": 0,  "intensity": 1},
+        {"time_ms": 5,  "intensity": 2},
+        {"time_ms": 6,  "intensity": 1},
+        {"time_ms": 9,  "intensity": 3},
+        {"time_ms": 14, "intensity": 1}
+      ],
+      "start_index": 0, "end_index": 4,
+      "apex_indices": [1, 3],
+      "is_apex_idx_1": 0, "is_apex_idx_2": 1
+    },
+    "samples": [
+      {"id": "run-01",
+       "samples": [
+         {"time_ms": 0,  "intensity": 1},
+         {"time_ms": 3,  "intensity": 4},
+         {"time_ms": 4,  "intensity": 2},
+         {"time_ms": 7,  "intensity": 5},
+         {"time_ms": 10, "intensity": 0}
+       ],
+       "start_index": 0, "end_index": 4,
+       "apex_indices": [1, 3],
+       "is_apex_idx_1": 0, "is_apex_idx_2": 1},
+      {"id": "run-02",
+       "samples": [
+         {"time_ms": 0,  "intensity": 1},
+         {"time_ms": 3,  "intensity": 4},
+         {"time_ms": 4,  "intensity": 2},
+         {"time_ms": 7,  "intensity": 5},
+         {"time_ms": 10, "intensity": 0}
+       ],
+       "start_index": 0, "end_index": 4,
+       "apex_indices": [1, 3],
+       "is_apex_idx_1": 0, "is_apex_idx_2": 1}
+    ]
+  }'
+```
+
+响应（结果与输入同序，版本 1，全部未确认；下例略去第二个样本与 `input` 回显）：
+
+```json
+{
+  "batch_id": "9dedc0eaa1d64013be2715b68b229158",
+  "version": 1,
+  "reference_peaks": [{"id": "A", "time_ms": 3}, {"id": "B", "time_ms": 7}],
+  "is_ref_id_1": "A", "is_ref_id_2": "B", "tolerance_ms": 0,
+  "blank": { "...": "创建时提交的 blank 运行" },
+  "samples": [
+    {"id": "run-01", "confirmed": false,
+     "result": {
+       "sample_peaks": [
+         {"ref_id": "A", "corrected_area": {"n": 3, "d": 2}},
+         {"ref_id": "B", "corrected_area": {"n": 4, "d": 1}}
+       ],
+       "area_scale": 2,
+       "peaks": [
+         {"time_ms": 3, "area": 3},
+         {"time_ms": 7, "area": 8}
+       ]
+     },
+     "input": { "...": "该样本的运行输入（id 在外层）" }
+    }
+  ]
+}
+```
+
+建议把批次 id 存入 shell 变量：
+
+```bash
+BID=$(curl -s -X POST http://localhost:8000/v1/blank-subtraction-batches \
+  -H 'Content-Type: application/json' -d @batch.json | jq -r .batch_id)
+```
+
+### `GET /v1/blank-subtraction-batches/{batch_id}`（读取）
+
+返回批次的完整当前状态（结构同创建响应）。批次不存在返回 **404**。
+只读已提交数据，不会见到创建/重算过程中的半成品状态。
+
+```bash
+curl -s http://localhost:8000/v1/blank-subtraction-batches/$BID | jq '.version, [.samples[] | {id, confirmed}]'
+```
+
+### `POST .../{batch_id}/confirm`（确认单个样本）
+
+请求体仅 `sample_id` 与 `expected_version`。成功后该样本 `confirmed` 变 true、
+版本加 1，返回批次完整状态：
+
+```bash
+curl -s -X POST \
+  http://localhost:8000/v1/blank-subtraction-batches/$BID/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"sample_id": "run-01", "expected_version": 1}'
+```
+
+### `POST .../{batch_id}/replace-blank`（替换 blank 并重算全部样本）
+
+请求体仅新 `blank` 与 `expected_version`。服务端用**原参考峰/内标/容差与原样本输入**
+重算全部样本：
+
+- 对每个**已确认**样本，按**峰顺序**逐峰比较 `(ref_id, time_ms, 约分校正面积 n/d)`；
+  **任一项改变则整批拒绝（409），消息指出首个受影响的样本 id**，blank、结果、确认状态、
+  版本全部不变（未确认样本同样不被局部重算，不允许混用空白）。
+- 已确认样本结果**全部未变**时允许替换：写入新 blank、全部样本按新 blank 重算后的结果，
+  确认状态保留，版本加 1。
+
+```bash
+# 用结果不变的 blank（例如与原 blank 等价的输入）替换 —— 成功，版本 +1
+curl -s -X POST \
+  http://localhost:8000/v1/blank-subtraction-batches/$BID/replace-blank \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "blank": {
+      "samples": [
+        {"time_ms": 0, "intensity": 1}, {"time_ms": 5, "intensity": 2},
+        {"time_ms": 6, "intensity": 1}, {"time_ms": 9, "intensity": 3},
+        {"time_ms": 14, "intensity": 1}
+      ],
+      "start_index": 0, "end_index": 4, "apex_indices": [1, 3],
+      "is_apex_idx_1": 0, "is_apex_idx_2": 1
+    },
+    "expected_version": 2
+  }'
+
+# 新 blank 会改变已确认样本的峰 -> 409，整批不变
+curl -s -X POST \
+  http://localhost:8000/v1/blank-subtraction-batches/$BID/replace-blank \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "blank": { "...": "会使 run-01 校正面积改变的 blank" },
+    "expected_version": 3
+  }'
+# => {"detail":"replacing the blank would change the confirmed result of sample 'run-01'"}
+```
+
+### 错误码汇总
+
+| 状态 | 触发情形 |
+| --- | --- |
+| `201` | 批次创建成功（`version` 为 1，全部未确认） |
+| `200` | 读取、确认、blank 替换成功（修改成功时 `version` 加 1） |
+| `404` | 批次 id 不存在；或确认时样本 id 不属于该批次 |
+| `409` | `expected_version` 过期；重复确认已确认样本；替换 blank 会改变任一已确认样本的结果（消息含样本 id） |
+| `422` | 计算失败或请求结构非法：创建时消息以 `sample "<id>": ` 或 `blank: ` 指出出错对象；替换时只有 blank 可变，故失败前缀为 `blank: `。另有样本数不在 1～8、样本 id 为空/重复、类型错误、缺字段等 |
+
+### 持久化与部署
+
+- 数据库路径由环境变量 **`BATCH_DB_PATH`** 控制；`docker compose up` 已把它设为
+  `/data/batches.db` 并挂载 Docker **命名卷 `peak-assign-data`**，容器重启（`restart`、
+  `docker compose restart`、重建容器）后批次仍可读取；仅 `docker compose down -v` 会清空。
+- 非 Docker 本地运行且未设置 `BATCH_DB_PATH` 时，数据库落在工作目录的 `./batches.db`
+  （SQLite WAL 模式，另含 `-wal`、`-shm` 伴随文件）。
+- 旧的无状态接口（`/v1/assign`、`/v1/standard-addition`、`/v1/integrate`、
+  `/v1/blank-subtraction`）保持不变，不使用数据库。
+
 ## 本地开发与测试
 
 不用 Docker 时：
@@ -565,19 +760,24 @@ pytest -q
 测试包含固定边界用例，以及 400 组随机实例与全局暴力枚举（枚举所有保序配对链）对拍，
 验证“最大配对数 → 最小绝对偏差和 → 字典序最小”三级目标；积分接口另有 300 组随机实例
 与独立浮点参照实现对拍，并含积分 → 归属 / 定量的端到端衔接测试。
+可复核批次测试覆盖创建/读取/确认/换 blank 重算的完整生命周期、422/404/409 各分支、
+“失败不留批次/不改状态”、同版本并发确认与替换的竞争（仅一项成功），
+以及用同一 SQLite 文件重开存储模拟容器重启后的持久化读取。
 
 ## 目录结构
 
 ```
 app/
-  main.py               # FastAPI 应用、路由、422 异常映射
+  main.py               # FastAPI 应用、路由、422/404/409 异常映射
   models.py             # 严格类型的请求/响应模型
   assignment.py         # 仿射校准 + 区间 DP 归属（纯函数）
   standard_addition.py  # 标准加入法：逐次归属 + 精确最小二乘（纯函数）
   integration.py        # 峰面积积分：分段 + 扣基线 + 精确梯形积分（纯函数）
   blank_subtraction.py  # 空白扣除：双运行积分 + 归属 + 精确相减（纯函数）
+  batches.py            # 可复核批次工作流：创建/确认/换 blank 重算（复用扣除逻辑）
+  storage.py            # SQLite 持久化：原子事务 + 版本乐观锁 + 已确认结果比较
 tests/                  # API 测试与算法对拍测试
 Dockerfile
-docker-compose.yml
+docker-compose.yml      # 单命令启动；命名卷 peak-assign-data 挂载到 /data
 requirements.txt
 ```
